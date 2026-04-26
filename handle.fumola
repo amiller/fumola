@@ -1,167 +1,287 @@
 //
-// scheduler-svc — multi-party 1:1 meeting scheduler, exposed as an
-// HTTP handler for tee-daemon.
+// Team-calendar demo for fumola in the browser.
 //
-// Handler contract:
-//   public func handle(method : Text, path : Text, body : Text) : Response
-// where
-//   Response = { status : Nat; headers : Record; body : Text; dcg : Text }
+// One shared TEE holds the team's calendar. Three people (alice, bob,
+// carol) each have a 5-day availability schedule (one cell per day,
+// true=free, false=busy). The TEE exposes several derived views, all
+// computed from the same cells:
 //
-// Endpoints (all GET; demo state is hard-coded):
-//   /                — index, lists endpoints
-//   /schedule        — runs the four canonical rounds, returns the chosen
-//                      day for each plus DCG receipts
-//   /schedule/v1     — single round at v1 (standard policies)
-//   /schedule/v2     — single round at v2 (bob blocks Tuesdays)
-//   /schedule/v3     — single round at v3 (alice maxed)
-//   /schedule/v4     — single round at v4 (alice raised cap)
+//   /free/<name>    per-person free-day count
+//   /pair/ab        first day alice and bob are both free
+//   /pair/ac        same for alice and carol
+//   /pair/bc        same for bob and carol
+//   /team           first day all three are free
 //
-// The router (proxy/runtimes.py ROUTER_FUMOLA) wraps the response with a
-// X-Fumola-DCG-Digest header computed over (project, method, path, body,
-// output). In an attested deployment, that digest is what the dstack
-// quote signs.
+// What the demo shows is what makes Adapton specifically useful:
+// successive queries reuse the cached sub-computations of earlier
+// queries. The team query uses pair-thunks; pair queries use cells.
+// Forcing /team after /pair/ab re-uses every pair_ab_<day> thunk for
+// free, and only computes pair_ac and pair_bc on demand.
+//
+// Per-call output:  { result; new_misses; new_hits; cumulative_misses;
+// cumulative_hits }  so the page can show the cache growing live.
 //
 module {
 
-  // ---- Policy builders -------------------------------------------------
+  // -----------------------------------------------------------------
+  // Initial schedule. Picked so each query has a distinct first-true
+  // day and the team query exercises every pair.
+  //
+  //         mon  tue  wed  thu  fri
+  // alice:   T    F    T    T    F
+  // bob:     T    T    F    T    F
+  // carol:   F    T    T    T    T
+  //
+  // Expected first feasible days:
+  //   pair AB: mon (both free)
+  //   pair AC: wed (alice free, carol free)
+  //   pair BC: tue
+  //   team:    thu (all three free)
+  // -----------------------------------------------------------------
 
-  func makeStandardParty(name, monH, tueH, wedH, thuH, friH, capV, meetingH) {
-    let m = `mon := monH;
-    let t = `tue := tueH;
-    let w = `wed := wedH;
-    let r = `thu := thuH;
-    let f = `fri := friH;
-    let cap = `cap := capV;
-    let am = `accepts_mon := thunk { ((@ m) + meetingH) <= (@ cap) };
-    let at = `accepts_tue := thunk { ((@ t) + meetingH) <= (@ cap) };
-    let aw = `accepts_wed := thunk { ((@ w) + meetingH) <= (@ cap) };
-    let ar = `accepts_thu := thunk { ((@ r) + meetingH) <= (@ cap) };
-    let af = `accepts_fri := thunk { ((@ f) + meetingH) <= (@ cap) };
-    { name; mon = m; tue = t; wed = w; thu = r; fri = f; cap;
-      accepts_mon = am; accepts_tue = at; accepts_wed = aw;
-      accepts_thu = ar; accepts_fri = af }
-  };
+  public func setup() {
+    // Person cells.
+    `alice-`mon := true;   `alice-`tue := false;
+    `alice-`wed := true;   `alice-`thu := true;
+    `alice-`fri := false;
+    `bob-`mon := true;     `bob-`tue := true;
+    `bob-`wed := false;    `bob-`thu := true;
+    `bob-`fri := false;
+    `carol-`mon := false;  `carol-`tue := true;
+    `carol-`wed := true;   `carol-`thu := true;
+    `carol-`fri := true;
 
-  func makeBlockingTuesdayParty(name, monH, tueH, wedH, thuH, friH, capV, meetingH) {
-    let m = `mon := monH;
-    let t = `tue := tueH;
-    let w = `wed := wedH;
-    let r = `thu := thuH;
-    let f = `fri := friH;
-    let cap = `cap := capV;
-    let am = `accepts_mon := thunk { ((@ m) + meetingH) <= (@ cap) };
-    let at = `accepts_tue := thunk { false };
-    let aw = `accepts_wed := thunk { ((@ w) + meetingH) <= (@ cap) };
-    let ar = `accepts_thu := thunk { ((@ r) + meetingH) <= (@ cap) };
-    let af = `accepts_fri := thunk { ((@ f) + meetingH) <= (@ cap) };
-    { name; mon = m; tue = t; wed = w; thu = r; fri = f; cap;
-      accepts_mon = am; accepts_tue = at; accepts_wed = aw;
-      accepts_thu = ar; accepts_fri = af }
-  };
+    let am = prim "adaptonPointer" (`alice-`mon);
+    let at = prim "adaptonPointer" (`alice-`tue);
+    let aw = prim "adaptonPointer" (`alice-`wed);
+    let ah = prim "adaptonPointer" (`alice-`thu);
+    let af = prim "adaptonPointer" (`alice-`fri);
+    let bm = prim "adaptonPointer" (`bob-`mon);
+    let bt = prim "adaptonPointer" (`bob-`tue);
+    let bw = prim "adaptonPointer" (`bob-`wed);
+    let bh = prim "adaptonPointer" (`bob-`thu);
+    let bf = prim "adaptonPointer" (`bob-`fri);
+    let cm = prim "adaptonPointer" (`carol-`mon);
+    let ct = prim "adaptonPointer" (`carol-`tue);
+    let cw = prim "adaptonPointer" (`carol-`wed);
+    let ch = prim "adaptonPointer" (`carol-`thu);
+    let cf = prim "adaptonPointer" (`carol-`fri);
 
-  func makeScheduler(a, b) {
-    do goto space `carol {
-      let fm = `fits_mon := thunk { (force (a.accepts_mon)) and (force (b.accepts_mon)) };
-      let ft = `fits_tue := thunk { (force (a.accepts_tue)) and (force (b.accepts_tue)) };
-      let fw = `fits_wed := thunk { (force (a.accepts_wed)) and (force (b.accepts_wed)) };
-      let fr = `fits_thu := thunk { (force (a.accepts_thu)) and (force (b.accepts_thu)) };
-      let ff = `fits_fri := thunk { (force (a.accepts_fri)) and (force (b.accepts_fri)) };
-      let first = `first_feasible := thunk {
-        if (force fm) { ?`mon }
-        else if (force ft) { ?`tue }
-        else if (force fw) { ?`wed }
-        else if (force fr) { ?`thu }
-        else if (force ff) { ?`fri }
-        else null
-      };
-      { fits_mon = fm; fits_tue = ft; fits_wed = fw;
-        fits_thu = fr; fits_fri = ff; first_feasible = first }
-    }
-  };
-
-  // ---- Round configs ---------------------------------------------------
-
-  // Same shape as runRound but returns only the chosen day. The DCG is
-  // *not* included in the body, so the response carries only the public
-  // verdict; the per-day fits booleans and the values each accepts thunk
-  // returned stay inside the TEE. The X-Fumola-DCG-Digest header still
-  // hashes the full DCG, so a verifier with the same inputs can replay
-  // and confirm — but an external observer with no inputs sees only the
-  // chosen day and the commitment hash. This is "minimal disclosure"
-  // mode: the receipt is a hash, not a list.
-  func runRoundPrivate(version) {
-    let r = runRound(version);
-    { version = r.version; chosen = r.chosen }
-  };
-
-  // Version is a variant tag (#v1, #v2, #v3, #v4) — fumola variants
-  // dispatch via `switch`, unlike `do quoted symbols which are not
-  // structurally equal even when their names match.
-  func runRound(version) {
-    let MEETING = 2;
-    prim "adaptonReset" (#graphical);
-    let alice = switch (version) {
-      case (#v1) { do goto space `alice { makeStandardParty(`alice, 7, 6, 7, 5, 4, 8, MEETING) } };
-      case (#v2) { do goto space `alice { makeStandardParty(`alice, 7, 6, 7, 5, 4, 8, MEETING) } };
-      case (#v3) { do goto space `alice { makeStandardParty(`alice, 8, 8, 8, 8, 8, 8, MEETING) } };
-      case (#v4) { do goto space `alice { makeStandardParty(`alice, 8, 8, 8, 8, 8, 10, MEETING) } };
+    // Per-person free counts.
+    `alice-`free_count := thunk {
+      (if (@ am) { 1 } else { 0 })
+      + (if (@ at) { 1 } else { 0 })
+      + (if (@ aw) { 1 } else { 0 })
+      + (if (@ ah) { 1 } else { 0 })
+      + (if (@ af) { 1 } else { 0 })
     };
-    let bob = switch (version) {
-      case (#v1) { do goto space `bob { makeStandardParty(`bob, 8, 4, 7, 5, 6, 8, MEETING) } };
-      case (_)   { do goto space `bob { makeBlockingTuesdayParty(`bob, 8, 4, 7, 5, 6, 8, MEETING) } };
+    `bob-`free_count := thunk {
+      (if (@ bm) { 1 } else { 0 })
+      + (if (@ bt) { 1 } else { 0 })
+      + (if (@ bw) { 1 } else { 0 })
+      + (if (@ bh) { 1 } else { 0 })
+      + (if (@ bf) { 1 } else { 0 })
     };
-    let c = makeScheduler(alice, bob);
-    let chosen = force (c.first_feasible);
-    let peek = (prim "adaptonPeekCell" (c.first_feasible)) !;
+    `carol-`free_count := thunk {
+      (if (@ cm) { 1 } else { 0 })
+      + (if (@ ct) { 1 } else { 0 })
+      + (if (@ cw) { 1 } else { 0 })
+      + (if (@ ch) { 1 } else { 0 })
+      + (if (@ cf) { 1 } else { 0 })
+    };
+
+    // Pair AB thunks per day.
+    `pair_ab-`mon := thunk { (@ am) and (@ bm) };
+    `pair_ab-`tue := thunk { (@ at) and (@ bt) };
+    `pair_ab-`wed := thunk { (@ aw) and (@ bw) };
+    `pair_ab-`thu := thunk { (@ ah) and (@ bh) };
+    `pair_ab-`fri := thunk { (@ af) and (@ bf) };
+    // Pair AC.
+    `pair_ac-`mon := thunk { (@ am) and (@ cm) };
+    `pair_ac-`tue := thunk { (@ at) and (@ ct) };
+    `pair_ac-`wed := thunk { (@ aw) and (@ cw) };
+    `pair_ac-`thu := thunk { (@ ah) and (@ ch) };
+    `pair_ac-`fri := thunk { (@ af) and (@ cf) };
+    // Pair BC.
+    `pair_bc-`mon := thunk { (@ bm) and (@ cm) };
+    `pair_bc-`tue := thunk { (@ bt) and (@ ct) };
+    `pair_bc-`wed := thunk { (@ bw) and (@ cw) };
+    `pair_bc-`thu := thunk { (@ bh) and (@ ch) };
+    `pair_bc-`fri := thunk { (@ bf) and (@ cf) };
+
+    // First-day-feasible-for-pair thunks.
+    let pab_m = prim "adaptonPointer" (`pair_ab-`mon);
+    let pab_t = prim "adaptonPointer" (`pair_ab-`tue);
+    let pab_w = prim "adaptonPointer" (`pair_ab-`wed);
+    let pab_h = prim "adaptonPointer" (`pair_ab-`thu);
+    let pab_f = prim "adaptonPointer" (`pair_ab-`fri);
+    `first_pair_ab := thunk {
+      if (force pab_m) { ?#mon }
+      else if (force pab_t) { ?#tue }
+      else if (force pab_w) { ?#wed }
+      else if (force pab_h) { ?#thu }
+      else if (force pab_f) { ?#fri }
+      else null
+    };
+    let pac_m = prim "adaptonPointer" (`pair_ac-`mon);
+    let pac_t = prim "adaptonPointer" (`pair_ac-`tue);
+    let pac_w = prim "adaptonPointer" (`pair_ac-`wed);
+    let pac_h = prim "adaptonPointer" (`pair_ac-`thu);
+    let pac_f = prim "adaptonPointer" (`pair_ac-`fri);
+    `first_pair_ac := thunk {
+      if (force pac_m) { ?#mon }
+      else if (force pac_t) { ?#tue }
+      else if (force pac_w) { ?#wed }
+      else if (force pac_h) { ?#thu }
+      else if (force pac_f) { ?#fri }
+      else null
+    };
+    let pbc_m = prim "adaptonPointer" (`pair_bc-`mon);
+    let pbc_t = prim "adaptonPointer" (`pair_bc-`tue);
+    let pbc_w = prim "adaptonPointer" (`pair_bc-`wed);
+    let pbc_h = prim "adaptonPointer" (`pair_bc-`thu);
+    let pbc_f = prim "adaptonPointer" (`pair_bc-`fri);
+    `first_pair_bc := thunk {
+      if (force pbc_m) { ?#mon }
+      else if (force pbc_t) { ?#tue }
+      else if (force pbc_w) { ?#wed }
+      else if (force pbc_h) { ?#thu }
+      else if (force pbc_f) { ?#fri }
+      else null
+    };
+
+    // Team-day thunks: AB and AC must both be true (which suffices to
+    // imply BC, given alice's freeness on a given day). Defined this
+    // way so team_<day> reuses the pair-thunk cache: forcing /team
+    // after /pair/ab gets cache hits on every pair_ab_<day>.
+    `team-`mon := thunk { (force pab_m) and (force pac_m) };
+    `team-`tue := thunk { (force pab_t) and (force pac_t) };
+    `team-`wed := thunk { (force pab_w) and (force pac_w) };
+    `team-`thu := thunk { (force pab_h) and (force pac_h) };
+    `team-`fri := thunk { (force pab_f) and (force pac_f) };
+
+    let tm = prim "adaptonPointer" (`team-`mon);
+    let tt = prim "adaptonPointer" (`team-`tue);
+    let tw = prim "adaptonPointer" (`team-`wed);
+    let th = prim "adaptonPointer" (`team-`thu);
+    let tf = prim "adaptonPointer" (`team-`fri);
+    `first_team := thunk {
+      if (force tm) { ?#mon }
+      else if (force tt) { ?#tue }
+      else if (force tw) { ?#wed }
+      else if (force th) { ?#thu }
+      else if (force tf) { ?#fri }
+      else null
+    };
+    "ok"
+  };
+
+  // -----------------------------------------------------------------
+  // Counter-aware query helper. Each query snapshots the cache stats
+  // before and after, so the page can show the per-call delta and the
+  // running total.
+  // -----------------------------------------------------------------
+
+  func snapshot() : { hits : Any; misses : Any } {
     {
-      version;
-      chosen;
-      dcg = peek.outgoingEdges;
+      hits = @ (`adapton(`counts)(`forceBeginCacheHit));
+      misses = @ (`adapton(`counts)(`forceBeginCacheMiss));
     }
   };
 
-  // ---- HTTP handler ----------------------------------------------------
+  func with_counters(tag, p) {
+    let s0 = snapshot();
+    let v = force p;
+    let s1 = snapshot();
+    {
+      view = tag;
+      result = v;
+      new_misses = (s1.misses) - (s0.misses);
+      new_hits = (s1.hits) - (s0.hits);
+      cumulative_misses = s1.misses;
+      cumulative_hits = s1.hits;
+    }
+  };
 
+  public func freeCount(who) {
+    switch (who) {
+      case (#alice) { with_counters(#alice_free, prim "adaptonPointer" (`alice-`free_count)) };
+      case (#bob)   { with_counters(#bob_free,   prim "adaptonPointer" (`bob-`free_count)) };
+      case (#carol) { with_counters(#carol_free, prim "adaptonPointer" (`carol-`free_count)) };
+    }
+  };
+
+  public func firstPair(pair) {
+    switch (pair) {
+      case (#ab) { with_counters(#first_pair_ab, prim "adaptonPointer" (`first_pair_ab)) };
+      case (#ac) { with_counters(#first_pair_ac, prim "adaptonPointer" (`first_pair_ac)) };
+      case (#bc) { with_counters(#first_pair_bc, prim "adaptonPointer" (`first_pair_bc)) };
+    }
+  };
+
+  public func firstTeam() {
+    with_counters(#first_team, prim "adaptonPointer" (`first_team))
+  };
+
+  // Peek the DCG of a named root. Useful for the receipt rendering.
+  public func peek(name) {
+    let p = switch (name) {
+      case (#alice_free)    { prim "adaptonPointer" (`alice-`free_count) };
+      case (#bob_free)      { prim "adaptonPointer" (`bob-`free_count) };
+      case (#carol_free)    { prim "adaptonPointer" (`carol-`free_count) };
+      case (#first_pair_ab) { prim "adaptonPointer" (`first_pair_ab) };
+      case (#first_pair_ac) { prim "adaptonPointer" (`first_pair_ac) };
+      case (#first_pair_bc) { prim "adaptonPointer" (`first_pair_bc) };
+      case (#first_team)    { prim "adaptonPointer" (`first_team) };
+    };
+    let cell = (prim "adaptonPeekCell" p);
+    switch (cell) {
+      case (?c) { c.outgoingEdges };
+      case (null) { [] };
+    }
+  };
+
+  // -----------------------------------------------------------------
+  // HTTP handler — delegates to the query funcs.
+  // -----------------------------------------------------------------
   public func handle(method, path, body) {
-    if (path == "/" or path == "") {
+    if (path == "/setup") {
+      { status = 200; headers = {}; body = setup() }
+    } else if (path == "/free/alice") {
+      { status = 200; headers = {}; body = freeCount(#alice) }
+    } else if (path == "/free/bob") {
+      { status = 200; headers = {}; body = freeCount(#bob) }
+    } else if (path == "/free/carol") {
+      { status = 200; headers = {}; body = freeCount(#carol) }
+    } else if (path == "/pair/ab") {
+      { status = 200; headers = {}; body = firstPair(#ab) }
+    } else if (path == "/pair/ac") {
+      { status = 200; headers = {}; body = firstPair(#ac) }
+    } else if (path == "/pair/bc") {
+      { status = 200; headers = {}; body = firstPair(#bc) }
+    } else if (path == "/team") {
+      { status = 200; headers = {}; body = firstTeam() }
+    } else if (path == "/peek/alice_free") {
+      { status = 200; headers = {}; body = peek(#alice_free) }
+    } else if (path == "/peek/bob_free") {
+      { status = 200; headers = {}; body = peek(#bob_free) }
+    } else if (path == "/peek/carol_free") {
+      { status = 200; headers = {}; body = peek(#carol_free) }
+    } else if (path == "/peek/first_pair_ab") {
+      { status = 200; headers = {}; body = peek(#first_pair_ab) }
+    } else if (path == "/peek/first_pair_ac") {
+      { status = 200; headers = {}; body = peek(#first_pair_ac) }
+    } else if (path == "/peek/first_pair_bc") {
+      { status = 200; headers = {}; body = peek(#first_pair_bc) }
+    } else if (path == "/peek/first_team") {
+      { status = 200; headers = {}; body = peek(#first_team) }
+    } else if (path == "/" or path == "") {
       {
-        status = 200;
-        headers = { content_type = "application/json" };
-        body = "{ \"endpoints\": [\"/schedule\", \"/schedule/v1\", \"/schedule/v2\", \"/schedule/v3\", \"/schedule/v4\"] }";
-      }
-    } else if (path == "/schedule/v1") {
-      { status = 200; headers = {}; body = runRound(#v1) }
-    } else if (path == "/schedule/v2") {
-      { status = 200; headers = {}; body = runRound(#v2) }
-    } else if (path == "/schedule/v3") {
-      { status = 200; headers = {}; body = runRound(#v3) }
-    } else if (path == "/schedule/v4") {
-      { status = 200; headers = {}; body = runRound(#v4) }
-    } else if (path == "/private/v1") {
-      { status = 200; headers = {}; body = runRoundPrivate(#v1) }
-    } else if (path == "/private/v2") {
-      { status = 200; headers = {}; body = runRoundPrivate(#v2) }
-    } else if (path == "/private/v3") {
-      { status = 200; headers = {}; body = runRoundPrivate(#v3) }
-    } else if (path == "/private/v4") {
-      { status = 200; headers = {}; body = runRoundPrivate(#v4) }
-    } else if (path == "/schedule") {
-      {
-        status = 200;
-        headers = {};
-        body = {
-          v1 = runRound(#v1);
-          v2 = runRound(#v2);
-          v3 = runRound(#v3);
-          v4 = runRound(#v4);
-        };
+        status = 200; headers = {};
+        body = "{ \"endpoints\": [\"/setup\", \"/free/{alice,bob,carol}\", \"/pair/{ab,ac,bc}\", \"/team\", \"/peek/<view>\"] }";
       }
     } else {
-      {
-        status = 404;
-        headers = {};
-        body = "not found";
-      }
+      { status = 404; headers = {}; body = "not found" }
     }
   };
 }
