@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>scheduler-svc — multi-party meeting scheduler in fumola</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 960px;
+      margin: 2em auto;
+      padding: 0 1em;
+      color: #222;
+      line-height: 1.5;
+    }
+    code, pre, .mono { font-family: "SF Mono", Menlo, Consolas, monospace; }
+    pre {
+      background: #f5f5f5;
+      padding: 0.8em 1em;
+      border-left: 3px solid #888;
+      overflow-x: auto;
+      font-size: 0.9em;
+    }
+    h1 { margin-bottom: 0.2em; }
+    .lede { color: #555; margin-top: 0; }
+    .rounds { display: flex; gap: 0.5em; flex-wrap: wrap; margin: 1em 0; }
+    .rounds button {
+      padding: 0.5em 1em;
+      border: 1px solid #888;
+      background: #fff;
+      cursor: pointer;
+      font: inherit;
+      border-radius: 3px;
+    }
+    .rounds button.active { background: #222; color: #fff; }
+    .panel {
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 1em;
+      margin: 1em 0;
+    }
+    .digest { word-break: break-all; font-size: 0.85em; color: #666; }
+    .verdict {
+      font-size: 1.4em;
+      font-weight: 600;
+      margin: 0.4em 0;
+    }
+    .verdict.fail { color: #b00; }
+    .verdict.ok { color: #060; }
+    .tree {
+      white-space: pre;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      background: #fafafa;
+      padding: 0.8em 1em;
+      border-radius: 3px;
+      font-size: 0.9em;
+    }
+    .narrative { color: #555; font-style: italic; margin: 0.5em 0 1em; }
+    a { color: #0366d6; }
+  </style>
+</head>
+<body>
+  <h1>scheduler-svc</h1>
+  <p class="lede">A multi-party 1:1 meeting scheduler, written in fumola, served from a tee-daemon CVM. Every response carries a deterministic <code>X-Fumola-DCG-Digest</code>.</p>
+
+  <p>Pick a round. The verdict and the DCG receipt come from the server; the digest below is the hash that an attested deployment would have signed with the dstack quote.</p>
+
+  <div class="rounds">
+    <button data-v="v1" class="active">v1 — standard policies</button>
+    <button data-v="v2">v2 — Bob blocks Tuesdays</button>
+    <button data-v="v3">v3 — Alice maxed out</button>
+    <button data-v="v4">v4 — Alice raises cap</button>
+  </div>
+
+  <div class="panel">
+    <div id="narrative" class="narrative"></div>
+    <div id="verdict" class="verdict"></div>
+    <div class="mono digest" id="digest"></div>
+
+    <h3>DCG receipt</h3>
+    <p>Each line is one question the scheduler asked, with the answer it observed. The receipt is the search trail: it shows exactly which days were inspected, and whose policies were consulted to decide each.</p>
+    <pre class="tree" id="tree">loading…</pre>
+
+    <h3>Raw response</h3>
+    <pre id="raw">loading…</pre>
+  </div>
+
+  <h2>What this is</h2>
+  <p>
+    Three principals — Alice, Bob, Carol — each in their own fumola space. Alice and Bob each
+    publish their own per-day acceptance policy as a fumola thunk; Carol composes them and
+    runs a short-circuiting search for the first feasible day. Each round is a different
+    snapshot of policies. The full source of the handler is one fumola module; the runtime
+    container loads it once and invokes <code>handle(method, path, body)</code> on every request.
+  </p>
+
+  <h2>Why the digest is the point</h2>
+  <p>
+    Every response includes <code>X-Fumola-DCG-Digest</code> — a sha256 over
+    <code>(project, method, path, body, output)</code>. Because the program is restricted to
+    deterministic prims (no clocks, no RNG, no I/O), two requests with the same inputs always
+    produce byte-identical outputs and therefore identical digests. In an attested deployment,
+    the dstack TEE quote signs over the digest; any client can replay the request and verify
+    by hash equality alone.
+  </p>
+
+  <h2>The narrative across the four rounds</h2>
+  <ul>
+    <li><strong>v1</strong>: standard cap-only policies on both sides. Tuesday fits.</li>
+    <li><strong>v2</strong>: Bob amends his published policy to refuse Tuesdays. The search has to look further; Thursday is the new first feasible day.</li>
+    <li><strong>v3</strong>: Alice's calendar fills up — every day is at her cap. With Bob's Tuesday block still in effect, no day fits. The receipt is a complete failure log.</li>
+    <li><strong>v4</strong>: Alice negotiates by raising her own cap from 8 to 10. She doesn't change anyone else's policy, doesn't unblock Bob's Tuesday — just amends her own bundle. Thursday becomes feasible again.</li>
+  </ul>
+
+  <script>
+    const API_BASE = window.location.pathname.replace(/\/(index\.html)?$/, "");
+    const NARRATIVE = {
+      v1: "Both parties run a vanilla cap-only policy. The scheduler short-circuits on the first day that fits.",
+      v2: "Bob amends his published policy bundle: a hard `false` on Tuesdays. Same data otherwise. The search has to inspect more days.",
+      v3: "Alice's existing schedule fills up — every day at her cap of 8. Combined with Bob's Tuesday block, no day fits. The DCG records every day inspected and every refusal.",
+      v4: "Alice negotiates by raising her own cap from 8 to 10. Bob's policy is unchanged. The result flips back to feasible.",
+    };
+
+    function parseEdgeLine(text) {
+      const targetMatch = text.match(/target\s*=\s*\(@adaptonSpace\s*\(([^)]+(?:\([^)]*\))*)\)/);
+      const target = targetMatch ? targetMatch[1].trim() : "?";
+      const valMatch = text.match(/#force_\([^,]+,\s*([^\)]+)\)/);
+      const value = valMatch ? valMatch[1].trim() : "?";
+      return { target, value };
+    }
+
+    function asciiTreeFromBody(body) {
+      const root = "carol(first_feasible)";
+      const edges = [];
+      const re = /#edgeId\((\d+)\),\s*\{[^]*?action\s*=\s*#force_\([^]*?,\s*([^)]+)\)[^]*?target\s*=\s*\(@adaptonSpace\s*\(([^)]+)\)/g;
+      let m;
+      while ((m = re.exec(body)) !== null) {
+        edges.push({ value: m[2].trim(), target: m[3].trim() });
+      }
+      let lines = [root];
+      edges.forEach((e, i) => {
+        const last = i === edges.length - 1;
+        lines.push(`${last ? "└── " : "├── "}force = ${e.value} → ${e.target}`);
+      });
+      return lines.join("\n");
+    }
+
+    function chosenLine(body) {
+      const m = body.match(/chosen\s*=\s*([^\n;]+)/);
+      return m ? m[1].trim() : "?";
+    }
+
+    async function load(v) {
+      document.querySelectorAll(".rounds button").forEach((b) =>
+        b.classList.toggle("active", b.dataset.v === v)
+      );
+      document.getElementById("narrative").textContent = NARRATIVE[v];
+      document.getElementById("verdict").textContent = "loading…";
+      document.getElementById("digest").textContent = "";
+      document.getElementById("tree").textContent = "loading…";
+      document.getElementById("raw").textContent = "loading…";
+
+      let resp;
+      try {
+        resp = await fetch(`${API_BASE}/schedule/${v}`);
+      } catch (err) {
+        document.getElementById("verdict").textContent = `fetch failed: ${err}`;
+        document.getElementById("verdict").className = "verdict fail";
+        return;
+      }
+      const digest = resp.headers.get("X-Fumola-DCG-Digest") || "(no digest)";
+      const text = await resp.text();
+      const chosen = chosenLine(text);
+      const tree = asciiTreeFromBody(text);
+      const ok = chosen.startsWith("?");
+      document.getElementById("verdict").className = "verdict " + (ok ? "ok" : "fail");
+      document.getElementById("verdict").textContent =
+        ok ? `chosen day: ${chosen}` : `no feasible day`;
+      document.getElementById("digest").textContent = `digest  ${digest}`;
+      document.getElementById("tree").textContent = tree;
+      document.getElementById("raw").textContent = text;
+    }
+
+    document.querySelectorAll(".rounds button").forEach((b) =>
+      b.addEventListener("click", () => load(b.dataset.v))
+    );
+    load("v1");
+  </script>
+</body>
+</html>
