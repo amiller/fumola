@@ -19,8 +19,10 @@ use fumola_parser::parser_types::SyntaxError;
 use fumola_semantics::format::format_one_line;
 use fumola_semantics::vm_types::{Core, ModuleFileInit, ModuleFileState, ModulePath};
 use fumola_semantics::Interruption;
-use fumola_syntax::ast::{Dec, Prog};
+use fumola_syntax::ast::{Dec, Loc, Prog, Source};
 use fumola_syntax::lexer::create_token_tree;
+use fumola_syntax::lexer_types::{GroupType, Token, TokenTree};
+use regex::Regex;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -36,11 +38,35 @@ struct EvalErr<'a> {
     error: &'a str,
 }
 
+fn spacify_token_tree(tt: TokenTree) -> TokenTree {
+    let re = Regex::new(r"\S").unwrap();
+    TokenTree::Token(Loc(
+        Token::Space(re.replace_all(&format!("{}", tt), " ").to_string()),
+        Source::Unknown,
+    ))
+}
+
+fn prepare_token_tree(tt: TokenTree) -> TokenTree {
+    match tt {
+        TokenTree::Token(Loc(ref token, _)) => match token {
+            Token::LineComment(_) | Token::BlockComment(_) => spacify_token_tree(tt),
+            _ => tt,
+        },
+        TokenTree::Group(_, GroupType::Comment, _) => spacify_token_tree(tt),
+        TokenTree::Group(trees, group, pair) => TokenTree::Group(
+            trees.into_iter().map(prepare_token_tree).collect(),
+            group,
+            pair,
+        ),
+    }
+}
+
 fn parse(input: &str) -> Result<Prog, SyntaxError> {
     let tt = create_token_tree(input).map_err(|_| SyntaxError::Custom {
         message: "Unknown lexer error".to_string(),
     })?;
-    let input_str = format!("{}", tt);
+    let prepared = prepare_token_tree(tt);
+    let input_str = format!("{}", prepared);
     ProgParser::new()
         .parse(&line_col::LineColLookup::new(&input_str), &input_str)
         .map_err(SyntaxError::from_parse_error)
