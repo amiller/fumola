@@ -110,6 +110,18 @@ async def invoke_fumola(method: str, path: str, body: bytes) -> dict:
     return {"status": 200, "raw": "\n".join(lines).strip()}
 
 
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js":   "application/javascript; charset=utf-8",
+    ".wasm": "application/wasm",
+    ".css":  "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".ts":   "application/typescript; charset=utf-8",
+    ".fumola": "text/plain; charset=utf-8",
+    ".txt":  "text/plain; charset=utf-8",
+}
+
+
 async def serve_index(request: web.Request) -> web.Response:
     if not os.path.isfile(INDEX_HTML):
         return web.Response(text="(no index.html)", status=404)
@@ -117,10 +129,39 @@ async def serve_index(request: web.Request) -> web.Response:
         return web.Response(body=f.read(), headers={"Content-Type": "text/html; charset=utf-8"})
 
 
+def serve_static(rel_path: str):
+    """Resolve a relative path under HERE; return Response or None."""
+    # Normalize and prevent escaping HERE.
+    rel = rel_path.lstrip("/")
+    if ".." in rel.split("/"):
+        return None
+    full = os.path.normpath(os.path.join(HERE, rel))
+    if not full.startswith(HERE):
+        return None
+    if not os.path.isfile(full):
+        return None
+    ext = os.path.splitext(full)[1].lower()
+    with open(full, "rb") as f:
+        return web.Response(
+            body=f.read(),
+            headers={"Content-Type": CONTENT_TYPES.get(ext, "application/octet-stream")},
+        )
+
+
+# Static-file paths (relative to this directory) that the browser may fetch.
+STATIC_PATHS = ("/handle.fumola", "/wasm-pkg/")
+
+
 async def route(request: web.Request) -> web.Response:
     path = request.path
     if path == "/" or path == "/index.html":
         return await serve_index(request)
+    if request.method == "GET":
+        for prefix in STATIC_PATHS:
+            if path == prefix or path.startswith(prefix):
+                resp = serve_static(path)
+                if resp is not None:
+                    return resp
     body = await request.read()
     result = await invoke_fumola(request.method, path, body)
     raw = result.get("raw", "")

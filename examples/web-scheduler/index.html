@@ -57,13 +57,31 @@
     }
     .narrative { color: #555; font-style: italic; margin: 0.5em 0 1em; }
     a { color: #0366d6; }
+    .modes { margin: 0.5em 0 1em; display: flex; gap: 0.5em; align-items: center; }
+    .modes label { font-weight: 500; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 3px;
+      font-size: 0.85em; font-weight: 500;
+    }
+    .badge.server { background: #ffebcd; color: #803400; }
+    .badge.browser { background: #d4edda; color: #155724; }
+    .wasm-status { color: #666; font-size: 0.85em; }
   </style>
 </head>
 <body>
   <h1>scheduler-svc</h1>
   <p class="lede">A multi-party 1:1 meeting scheduler, written in fumola, served from a tee-daemon CVM. Every response carries a deterministic <code>X-Fumola-DCG-Digest</code>.</p>
 
-  <p>Pick a round. The verdict and the DCG receipt come from the server; the digest below is the hash that an attested deployment would have signed with the dstack quote.</p>
+  <p>Pick a round. The verdict and the DCG receipt come from either the server (the attested authority) or your browser (the same fumola interpreter compiled to WebAssembly), your choice.</p>
+
+  <div class="modes">
+    <label>compute mode:</label>
+    <input type="radio" name="mode" id="mode-server" value="server" checked>
+    <label for="mode-server"><span class="badge server">server</span> — fetch from <code>/schedule/&lt;v&gt;</code></label>
+    <input type="radio" name="mode" id="mode-browser" value="browser">
+    <label for="mode-browser"><span class="badge browser">browser</span> — fumola.wasm in this tab</label>
+    <span id="wasm-status" class="wasm-status"></span>
+  </div>
 
   <div class="rounds">
     <button data-v="v1" class="active">v1 — standard policies</button>
@@ -112,7 +130,9 @@
     <li><strong>v4</strong>: Alice negotiates by raising her own cap from 8 to 10. She doesn't change anyone else's policy, doesn't unblock Bob's Tuesday — just amends her own bundle. Thursday becomes feasible again.</li>
   </ul>
 
-  <script>
+  <script type="module">
+    import init, { FumolaState } from "./wasm-pkg/fumola_wasm.js";
+
     const API_BASE = window.location.pathname.replace(/\/(index\.html)?$/, "");
     const NARRATIVE = {
       v1: "Both parties run a vanilla cap-only policy. The scheduler short-circuits on the first day that fits.",
@@ -150,6 +170,68 @@
       return m ? m[1].trim() : "?";
     }
 
+    // ---- Browser-side state (lazy) -----------------------------------
+    let wasmReady = null;          // Promise<FumolaState>
+    let handleSource = null;       // text of handle.fumola
+
+    async function ensureWasm() {
+      if (wasmReady) return wasmReady;
+      document.getElementById("wasm-status").textContent = "loading fumola.wasm (~5 MB) …";
+      wasmReady = (async () => {
+        await init();
+        const handleResp = await fetch("./handle.fumola");
+        if (!handleResp.ok) throw new Error("could not fetch handle.fumola");
+        handleSource = await handleResp.text();
+        const state = new FumolaState();
+        const err = state.setModule("handle", handleSource);
+        if (err) throw new Error("setModule: " + err);
+        document.getElementById("wasm-status").textContent = "fumola.wasm ready";
+        return state;
+      })();
+      return wasmReady;
+    }
+
+    async function sha256Hex(...parts) {
+      const enc = new TextEncoder();
+      const NUL = new Uint8Array([0]);
+      let chunks = [];
+      for (const p of parts) {
+        chunks.push(enc.encode(p));
+        chunks.push(NUL);
+      }
+      let total = 0;
+      for (const c of chunks) total += c.length;
+      const buf = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { buf.set(c, off); off += c.length; }
+      const hash = await crypto.subtle.digest("SHA-256", buf);
+      return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function getMode() {
+      return document.querySelector('input[name="mode"]:checked').value;
+    }
+
+    async function loadFromServer(v) {
+      const resp = await fetch(`${API_BASE}/schedule/${v}`);
+      const digest = resp.headers.get("X-Fumola-DCG-Digest") || "(no digest)";
+      const text = await resp.text();
+      return { source: "server", text, digest };
+    }
+
+    async function loadFromBrowser(v) {
+      const state = await ensureWasm();
+      const program = `import H "handle"; H.handle("GET", "/schedule/${v}", "")`;
+      const json = state.eval(program);
+      const result = JSON.parse(json);
+      if (!result.ok) {
+        return { source: "browser", text: `fumola error: ${result.error}`, digest: "(error)" };
+      }
+      const text = result.output;
+      const digest = await sha256Hex("scheduler-svc", "GET", `/schedule/${v}`, "", text);
+      return { source: "browser", text, digest };
+    }
+
     async function load(v) {
       document.querySelectorAll(".rounds button").forEach((b) =>
         b.classList.toggle("active", b.dataset.v === v)
@@ -160,29 +242,35 @@
       document.getElementById("tree").textContent = "loading…";
       document.getElementById("raw").textContent = "loading…";
 
-      let resp;
+      let result;
       try {
-        resp = await fetch(`${API_BASE}/schedule/${v}`);
+        result = getMode() === "server" ? await loadFromServer(v) : await loadFromBrowser(v);
       } catch (err) {
-        document.getElementById("verdict").textContent = `fetch failed: ${err}`;
+        document.getElementById("verdict").textContent = `failed: ${err.message || err}`;
         document.getElementById("verdict").className = "verdict fail";
         return;
       }
-      const digest = resp.headers.get("X-Fumola-DCG-Digest") || "(no digest)";
-      const text = await resp.text();
-      const chosen = chosenLine(text);
-      const tree = asciiTreeFromBody(text);
+
+      const chosen = chosenLine(result.text);
+      const tree = asciiTreeFromBody(result.text);
       const ok = chosen.startsWith("?");
       document.getElementById("verdict").className = "verdict " + (ok ? "ok" : "fail");
       document.getElementById("verdict").textContent =
         ok ? `chosen day: ${chosen}` : `no feasible day`;
-      document.getElementById("digest").textContent = `digest  ${digest}`;
+      document.getElementById("digest").textContent =
+        `${result.source} digest  ${result.digest}`;
       document.getElementById("tree").textContent = tree;
-      document.getElementById("raw").textContent = text;
+      document.getElementById("raw").textContent = result.text;
     }
 
     document.querySelectorAll(".rounds button").forEach((b) =>
       b.addEventListener("click", () => load(b.dataset.v))
+    );
+    document.querySelectorAll('input[name="mode"]').forEach((r) =>
+      r.addEventListener("change", () => {
+        const active = document.querySelector(".rounds button.active");
+        if (active) load(active.dataset.v);
+      })
     );
     load("v1");
   </script>

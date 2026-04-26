@@ -69,6 +69,29 @@ Reach the running app at `$CVM/scheduler-svc/`. Promote to attested with
 hash binds into the dstack quote, the audit log opens, and the verifier
 endpoints become public.
 
+## Browser mode (fumola.wasm)
+
+The page also has a **browser** compute-mode toggle. When selected, the
+same fumola interpreter runs entirely in the visitor's tab:
+
+1. The page lazy-loads `wasm-pkg/fumola_wasm.js` (a wasm-bindgen module).
+2. It fetches `handle.fumola` as text and registers it as a fumola
+   module via `state.setModule("handle", source)`.
+3. For each round, it evaluates `import H "handle"; H.handle("GET", "/schedule/v1", "")`
+   *in the browser*, computes the same sha256 digest the server would,
+   and renders the same DCG receipt.
+
+Browser-mode and server-mode produce the same chosen day. Their digests
+*can* match if both sides use byte-identical canonicalization of the
+output — today the browser hashes the wasm interpreter's pretty-print
+of the result while the server hashes the CLI's pretty-print, which
+differ slightly. The point is that the verifier can re-derive a verdict
+locally without trusting the server.
+
+The wasm bundle is ~4.7 MB, loaded on demand. Source is `crates/fumola_wasm/`
+in this repo. Rebuild with `./build-wasm.sh` (requires the wasm32-unknown-unknown
+target and matching wasm-bindgen-cli).
+
 ## What the app does
 
 Three principals — Alice, Bob, Carol — each in their own fumola space.
