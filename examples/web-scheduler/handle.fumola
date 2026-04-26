@@ -81,6 +81,19 @@ module {
 
   // ---- Round configs ---------------------------------------------------
 
+  // Same shape as runRound but returns only the chosen day. The DCG is
+  // *not* included in the body, so the response carries only the public
+  // verdict; the per-day fits booleans and the values each accepts thunk
+  // returned stay inside the TEE. The X-Fumola-DCG-Digest header still
+  // hashes the full DCG, so a verifier with the same inputs can replay
+  // and confirm — but an external observer with no inputs sees only the
+  // chosen day and the commitment hash. This is "minimal disclosure"
+  // mode: the receipt is a hash, not a list.
+  func runRoundPrivate(version) {
+    let r = runRound(version);
+    { version = r.version; chosen = r.chosen }
+  };
+
   // Version is a variant tag (#v1, #v2, #v3, #v4) — fumola variants
   // dispatch via `switch`, unlike `do quoted symbols which are not
   // structurally equal even when their names match.
@@ -124,6 +137,14 @@ module {
       { status = 200; headers = {}; body = runRound(#v3) }
     } else if (path == "/schedule/v4") {
       { status = 200; headers = {}; body = runRound(#v4) }
+    } else if (path == "/private/v1") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v1) }
+    } else if (path == "/private/v2") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v2) }
+    } else if (path == "/private/v3") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v3) }
+    } else if (path == "/private/v4") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v4) }
     } else if (path == "/schedule") {
       {
         status = 200;
