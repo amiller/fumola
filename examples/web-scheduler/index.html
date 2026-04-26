@@ -272,7 +272,30 @@
         if (active) load(active.dataset.v);
       })
     );
-    load("v1");
+
+    // Detect whether the server endpoints are reachable. If not (e.g. on
+    // GitHub Pages with only the static files), hide the server-mode
+    // option and default to browser mode.
+    async function detectServerMode() {
+      try {
+        const r = await fetch(`${API_BASE}/schedule/v1`, { method: "HEAD" });
+        return r.ok;
+      } catch {
+        return false;
+      }
+    }
+
+    (async () => {
+      const serverAvailable = await detectServerMode();
+      if (!serverAvailable) {
+        document.getElementById("mode-server").disabled = true;
+        document.querySelector('label[for="mode-server"]').style.opacity = "0.4";
+        document.querySelector('label[for="mode-server"]').title =
+          "no fumola server reachable on this URL — browser mode only";
+        document.getElementById("mode-browser").checked = true;
+      }
+      load("v1");
+    })();
   </script>
 </body>
 </html>
