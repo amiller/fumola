@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>scheduler-svc — multi-party meeting scheduler in fumola</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 960px;
+      margin: 2em auto;
+      padding: 0 1em;
+      color: #222;
+      line-height: 1.5;
+    }
+    code, pre, .mono { font-family: "SF Mono", Menlo, Consolas, monospace; }
+    pre {
+      background: #f5f5f5;
+      padding: 0.8em 1em;
+      border-left: 3px solid #888;
+      overflow-x: auto;
+      font-size: 0.9em;
+    }
+    h1 { margin-bottom: 0.2em; }
+    .lede { color: #555; margin-top: 0; }
+    .rounds { display: flex; gap: 0.5em; flex-wrap: wrap; margin: 1em 0; }
+    .rounds button {
+      padding: 0.5em 1em;
+      border: 1px solid #888;
+      background: #fff;
+      cursor: pointer;
+      font: inherit;
+      border-radius: 3px;
+    }
+    .rounds button.active { background: #222; color: #fff; }
+    .panel {
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 1em;
+      margin: 1em 0;
+    }
+    .digest { word-break: break-all; font-size: 0.85em; color: #666; }
+    .verdict {
+      font-size: 1.4em;
+      font-weight: 600;
+      margin: 0.4em 0;
+    }
+    .verdict.fail { color: #b00; }
+    .verdict.ok { color: #060; }
+    .tree {
+      white-space: pre;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      background: #fafafa;
+      padding: 0.8em 1em;
+      border-radius: 3px;
+      font-size: 0.9em;
+    }
+    .narrative { color: #555; font-style: italic; margin: 0.5em 0 1em; }
+    a { color: #0366d6; }
+    .modes { margin: 0.5em 0 1em; display: flex; gap: 0.5em; align-items: center; }
+    .modes label { font-weight: 500; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 3px;
+      font-size: 0.85em; font-weight: 500;
+    }
+    .badge.server { background: #ffebcd; color: #803400; }
+    .badge.browser { background: #d4edda; color: #155724; }
+    .wasm-status { color: #666; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>scheduler-svc</h1>
+  <p class="lede">A multi-party 1:1 meeting scheduler, written in fumola, served from a tee-daemon CVM. Every response carries a deterministic <code>X-Fumola-DCG-Digest</code>.</p>
+
+  <p>Pick a round. The verdict and the DCG receipt come from either the server (the attested authority) or your browser (the same fumola interpreter compiled to WebAssembly), your choice.</p>
+
+  <div class="modes">
+    <label>compute mode:</label>
+    <input type="radio" name="mode" id="mode-server" value="server" checked>
+    <label for="mode-server"><span class="badge server">server</span> — fetch from <code>/schedule/&lt;v&gt;</code></label>
+    <input type="radio" name="mode" id="mode-browser" value="browser">
+    <label for="mode-browser"><span class="badge browser">browser</span> — fumola.wasm in this tab</label>
+    <span id="wasm-status" class="wasm-status"></span>
+  </div>
+
+  <div class="rounds">
+    <button data-v="v1" class="active">v1 — standard policies</button>
+    <button data-v="v2">v2 — Bob blocks Tuesdays</button>
+    <button data-v="v3">v3 — Alice maxed out</button>
+    <button data-v="v4">v4 — Alice raises cap</button>
+  </div>
+
+  <div class="panel">
+    <div id="narrative" class="narrative"></div>
+    <div id="verdict" class="verdict"></div>
+    <div class="mono digest" id="digest"></div>
+
+    <h3>DCG receipt</h3>
+    <p>Each line is one question the scheduler asked, with the answer it observed. The receipt is the search trail: it shows exactly which days were inspected, and whose policies were consulted to decide each.</p>
+    <pre class="tree" id="tree">loading…</pre>
+
+    <h3>Raw response</h3>
+    <pre id="raw">loading…</pre>
+  </div>
+
+  <h2>What this is</h2>
+  <p>
+    Three principals — Alice, Bob, Carol — each in their own fumola space. Alice and Bob each
+    publish their own per-day acceptance policy as a fumola thunk; Carol composes them and
+    runs a short-circuiting search for the first feasible day. Each round is a different
+    snapshot of policies. The full source of the handler is one fumola module; the runtime
+    container loads it once and invokes <code>handle(method, path, body)</code> on every request.
+  </p>
+
+  <h2>Why the digest is the point</h2>
+  <p>
+    Every response includes <code>X-Fumola-DCG-Digest</code> — a sha256 over
+    <code>(project, method, path, body, output)</code>. Because the program is restricted to
+    deterministic prims (no clocks, no RNG, no I/O), two requests with the same inputs always
+    produce byte-identical outputs and therefore identical digests. In an attested deployment,
+    the dstack TEE quote signs over the digest; any client can replay the request and verify
+    by hash equality alone.
+  </p>
+
+  <h2>The narrative across the four rounds</h2>
+  <ul>
+    <li><strong>v1</strong>: standard cap-only policies on both sides. Tuesday fits.</li>
+    <li><strong>v2</strong>: Bob amends his published policy to refuse Tuesdays. The search has to look further; Thursday is the new first feasible day.</li>
+    <li><strong>v3</strong>: Alice's calendar fills up — every day is at her cap. With Bob's Tuesday block still in effect, no day fits. The receipt is a complete failure log.</li>
+    <li><strong>v4</strong>: Alice negotiates by raising her own cap from 8 to 10. She doesn't change anyone else's policy, doesn't unblock Bob's Tuesday — just amends her own bundle. Thursday becomes feasible again.</li>
+  </ul>
+
+  <script type="module">
+    import init, { FumolaState } from "./wasm-pkg/fumola_wasm.js";
+
+    const API_BASE = window.location.pathname.replace(/\/(index\.html)?$/, "");
+    const NARRATIVE = {
+      v1: "Both parties run a vanilla cap-only policy. The scheduler short-circuits on the first day that fits.",
+      v2: "Bob amends his published policy bundle: a hard `false` on Tuesdays. Same data otherwise. The search has to inspect more days.",
+      v3: "Alice's existing schedule fills up — every day at her cap of 8. Combined with Bob's Tuesday block, no day fits. The DCG records every day inspected and every refusal.",
+      v4: "Alice negotiates by raising her own cap from 8 to 10. Bob's policy is unchanged. The result flips back to feasible.",
+    };
+
+    function parseEdgeLine(text) {
+      const targetMatch = text.match(/target\s*=\s*\(@adaptonSpace\s*\(([^)]+(?:\([^)]*\))*)\)/);
+      const target = targetMatch ? targetMatch[1].trim() : "?";
+      const valMatch = text.match(/#force_\([^,]+,\s*([^\)]+)\)/);
+      const value = valMatch ? valMatch[1].trim() : "?";
+      return { target, value };
+    }
+
+    function asciiTreeFromBody(body) {
+      const root = "carol(first_feasible)";
+      const edges = [];
+      const re = /#edgeId\((\d+)\),\s*\{[^]*?action\s*=\s*#force_\([^]*?,\s*([^)]+)\)[^]*?target\s*=\s*\(@adaptonSpace\s*\(([^)]+)\)/g;
+      let m;
+      while ((m = re.exec(body)) !== null) {
+        edges.push({ value: m[2].trim(), target: m[3].trim() });
+      }
+      let lines = [root];
+      edges.forEach((e, i) => {
+        const last = i === edges.length - 1;
+        lines.push(`${last ? "└── " : "├── "}force = ${e.value} → ${e.target}`);
+      });
+      return lines.join("\n");
+    }
+
+    function chosenLine(body) {
+      const m = body.match(/chosen\s*=\s*([^\n;]+)/);
+      return m ? m[1].trim() : "?";
+    }
+
+    // ---- Browser-side state (lazy) -----------------------------------
+    let wasmReady = null;          // Promise<FumolaState>
+    let handleSource = null;       // text of handle.fumola
+
+    async function ensureWasm() {
+      if (wasmReady) return wasmReady;
+      document.getElementById("wasm-status").textContent = "loading fumola.wasm (~5 MB) …";
+      wasmReady = (async () => {
+        await init();
+        const handleResp = await fetch("./handle.fumola");
+        if (!handleResp.ok) throw new Error("could not fetch handle.fumola");
+        handleSource = await handleResp.text();
+        const state = new FumolaState();
+        const err = state.setModule("handle", handleSource);
+        if (err) throw new Error("setModule: " + err);
+        document.getElementById("wasm-status").textContent = "fumola.wasm ready";
+        return state;
+      })();
+      return wasmReady;
+    }
+
+    async function sha256Hex(...parts) {
+      const enc = new TextEncoder();
+      const NUL = new Uint8Array([0]);
+      let chunks = [];
+      for (const p of parts) {
+        chunks.push(enc.encode(p));
+        chunks.push(NUL);
+      }
+      let total = 0;
+      for (const c of chunks) total += c.length;
+      const buf = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { buf.set(c, off); off += c.length; }
+      const hash = await crypto.subtle.digest("SHA-256", buf);
+      return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function getMode() {
+      return document.querySelector('input[name="mode"]:checked').value;
+    }
+
+    async function loadFromServer(v) {
+      const resp = await fetch(`${API_BASE}/schedule/${v}`);
+      const digest = resp.headers.get("X-Fumola-DCG-Digest") || "(no digest)";
+      const text = await resp.text();
+      return { source: "server", text, digest };
+    }
+
+    async function loadFromBrowser(v) {
+      const state = await ensureWasm();
+      const program = `import H "handle"; H.handle("GET", "/schedule/${v}", "")`;
+      const json = state.eval(program);
+      const result = JSON.parse(json);
+      if (!result.ok) {
+        return { source: "browser", text: `fumola error: ${result.error}`, digest: "(error)" };
+      }
+      const text = result.output;
+      const digest = await sha256Hex("scheduler-svc", "GET", `/schedule/${v}`, "", text);
+      return { source: "browser", text, digest };
+    }
+
+    async function load(v) {
+      document.querySelectorAll(".rounds button").forEach((b) =>
+        b.classList.toggle("active", b.dataset.v === v)
+      );
+      document.getElementById("narrative").textContent = NARRATIVE[v];
+      document.getElementById("verdict").textContent = "loading…";
+      document.getElementById("digest").textContent = "";
+      document.getElementById("tree").textContent = "loading…";
+      document.getElementById("raw").textContent = "loading…";
+
+      let result;
+      try {
+        result = getMode() === "server" ? await loadFromServer(v) : await loadFromBrowser(v);
+      } catch (err) {
+        document.getElementById("verdict").textContent = `failed: ${err.message || err}`;
+        document.getElementById("verdict").className = "verdict fail";
+        return;
+      }
+
+      const chosen = chosenLine(result.text);
+      const tree = asciiTreeFromBody(result.text);
+      const ok = chosen.startsWith("?");
+      document.getElementById("verdict").className = "verdict " + (ok ? "ok" : "fail");
+      document.getElementById("verdict").textContent =
+        ok ? `chosen day: ${chosen}` : `no feasible day`;
+      document.getElementById("digest").textContent =
+        `${result.source} digest  ${result.digest}`;
+      document.getElementById("tree").textContent = tree;
+      document.getElementById("raw").textContent = result.text;
+    }
+
+    document.querySelectorAll(".rounds button").forEach((b) =>
+      b.addEventListener("click", () => load(b.dataset.v))
+    );
+    document.querySelectorAll('input[name="mode"]').forEach((r) =>
+      r.addEventListener("change", () => {
+        const active = document.querySelector(".rounds button.active");
+        if (active) load(active.dataset.v);
+      })
+    );
+
+    // Detect whether the server endpoints are reachable. If not (e.g. on
+    // GitHub Pages with only the static files), hide the server-mode
+    // option and default to browser mode.
+    async function detectServerMode() {
+      try {
+        const r = await fetch(`${API_BASE}/schedule/v1`, { method: "HEAD" });
+        return r.ok;
+      } catch {
+        return false;
+      }
+    }
+
+    (async () => {
+      const serverAvailable = await detectServerMode();
+      if (!serverAvailable) {
+        document.getElementById("mode-server").disabled = true;
+        document.querySelector('label[for="mode-server"]').style.opacity = "0.4";
+        document.querySelector('label[for="mode-server"]').title =
+          "no fumola server reachable on this URL — browser mode only";
+        document.getElementById("mode-browser").checked = true;
+      }
+      load("v1");
+    })();
+  </script>
+</body>
+</html>

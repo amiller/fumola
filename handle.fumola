@@ -1,0 +1,167 @@
+//
+// scheduler-svc — multi-party 1:1 meeting scheduler, exposed as an
+// HTTP handler for tee-daemon.
+//
+// Handler contract:
+//   public func handle(method : Text, path : Text, body : Text) : Response
+// where
+//   Response = { status : Nat; headers : Record; body : Text; dcg : Text }
+//
+// Endpoints (all GET; demo state is hard-coded):
+//   /                — index, lists endpoints
+//   /schedule        — runs the four canonical rounds, returns the chosen
+//                      day for each plus DCG receipts
+//   /schedule/v1     — single round at v1 (standard policies)
+//   /schedule/v2     — single round at v2 (bob blocks Tuesdays)
+//   /schedule/v3     — single round at v3 (alice maxed)
+//   /schedule/v4     — single round at v4 (alice raised cap)
+//
+// The router (proxy/runtimes.py ROUTER_FUMOLA) wraps the response with a
+// X-Fumola-DCG-Digest header computed over (project, method, path, body,
+// output). In an attested deployment, that digest is what the dstack
+// quote signs.
+//
+module {
+
+  // ---- Policy builders -------------------------------------------------
+
+  func makeStandardParty(name, monH, tueH, wedH, thuH, friH, capV, meetingH) {
+    let m = `mon := monH;
+    let t = `tue := tueH;
+    let w = `wed := wedH;
+    let r = `thu := thuH;
+    let f = `fri := friH;
+    let cap = `cap := capV;
+    let am = `accepts_mon := thunk { ((@ m) + meetingH) <= (@ cap) };
+    let at = `accepts_tue := thunk { ((@ t) + meetingH) <= (@ cap) };
+    let aw = `accepts_wed := thunk { ((@ w) + meetingH) <= (@ cap) };
+    let ar = `accepts_thu := thunk { ((@ r) + meetingH) <= (@ cap) };
+    let af = `accepts_fri := thunk { ((@ f) + meetingH) <= (@ cap) };
+    { name; mon = m; tue = t; wed = w; thu = r; fri = f; cap;
+      accepts_mon = am; accepts_tue = at; accepts_wed = aw;
+      accepts_thu = ar; accepts_fri = af }
+  };
+
+  func makeBlockingTuesdayParty(name, monH, tueH, wedH, thuH, friH, capV, meetingH) {
+    let m = `mon := monH;
+    let t = `tue := tueH;
+    let w = `wed := wedH;
+    let r = `thu := thuH;
+    let f = `fri := friH;
+    let cap = `cap := capV;
+    let am = `accepts_mon := thunk { ((@ m) + meetingH) <= (@ cap) };
+    let at = `accepts_tue := thunk { false };
+    let aw = `accepts_wed := thunk { ((@ w) + meetingH) <= (@ cap) };
+    let ar = `accepts_thu := thunk { ((@ r) + meetingH) <= (@ cap) };
+    let af = `accepts_fri := thunk { ((@ f) + meetingH) <= (@ cap) };
+    { name; mon = m; tue = t; wed = w; thu = r; fri = f; cap;
+      accepts_mon = am; accepts_tue = at; accepts_wed = aw;
+      accepts_thu = ar; accepts_fri = af }
+  };
+
+  func makeScheduler(a, b) {
+    do goto space `carol {
+      let fm = `fits_mon := thunk { (force (a.accepts_mon)) and (force (b.accepts_mon)) };
+      let ft = `fits_tue := thunk { (force (a.accepts_tue)) and (force (b.accepts_tue)) };
+      let fw = `fits_wed := thunk { (force (a.accepts_wed)) and (force (b.accepts_wed)) };
+      let fr = `fits_thu := thunk { (force (a.accepts_thu)) and (force (b.accepts_thu)) };
+      let ff = `fits_fri := thunk { (force (a.accepts_fri)) and (force (b.accepts_fri)) };
+      let first = `first_feasible := thunk {
+        if (force fm) { ?`mon }
+        else if (force ft) { ?`tue }
+        else if (force fw) { ?`wed }
+        else if (force fr) { ?`thu }
+        else if (force ff) { ?`fri }
+        else null
+      };
+      { fits_mon = fm; fits_tue = ft; fits_wed = fw;
+        fits_thu = fr; fits_fri = ff; first_feasible = first }
+    }
+  };
+
+  // ---- Round configs ---------------------------------------------------
+
+  // Same shape as runRound but returns only the chosen day. The DCG is
+  // *not* included in the body, so the response carries only the public
+  // verdict; the per-day fits booleans and the values each accepts thunk
+  // returned stay inside the TEE. The X-Fumola-DCG-Digest header still
+  // hashes the full DCG, so a verifier with the same inputs can replay
+  // and confirm — but an external observer with no inputs sees only the
+  // chosen day and the commitment hash. This is "minimal disclosure"
+  // mode: the receipt is a hash, not a list.
+  func runRoundPrivate(version) {
+    let r = runRound(version);
+    { version = r.version; chosen = r.chosen }
+  };
+
+  // Version is a variant tag (#v1, #v2, #v3, #v4) — fumola variants
+  // dispatch via `switch`, unlike `do quoted symbols which are not
+  // structurally equal even when their names match.
+  func runRound(version) {
+    let MEETING = 2;
+    prim "adaptonReset" (#graphical);
+    let alice = switch (version) {
+      case (#v1) { do goto space `alice { makeStandardParty(`alice, 7, 6, 7, 5, 4, 8, MEETING) } };
+      case (#v2) { do goto space `alice { makeStandardParty(`alice, 7, 6, 7, 5, 4, 8, MEETING) } };
+      case (#v3) { do goto space `alice { makeStandardParty(`alice, 8, 8, 8, 8, 8, 8, MEETING) } };
+      case (#v4) { do goto space `alice { makeStandardParty(`alice, 8, 8, 8, 8, 8, 10, MEETING) } };
+    };
+    let bob = switch (version) {
+      case (#v1) { do goto space `bob { makeStandardParty(`bob, 8, 4, 7, 5, 6, 8, MEETING) } };
+      case (_)   { do goto space `bob { makeBlockingTuesdayParty(`bob, 8, 4, 7, 5, 6, 8, MEETING) } };
+    };
+    let c = makeScheduler(alice, bob);
+    let chosen = force (c.first_feasible);
+    let peek = (prim "adaptonPeekCell" (c.first_feasible)) !;
+    {
+      version;
+      chosen;
+      dcg = peek.outgoingEdges;
+    }
+  };
+
+  // ---- HTTP handler ----------------------------------------------------
+
+  public func handle(method, path, body) {
+    if (path == "/" or path == "") {
+      {
+        status = 200;
+        headers = { content_type = "application/json" };
+        body = "{ \"endpoints\": [\"/schedule\", \"/schedule/v1\", \"/schedule/v2\", \"/schedule/v3\", \"/schedule/v4\"] }";
+      }
+    } else if (path == "/schedule/v1") {
+      { status = 200; headers = {}; body = runRound(#v1) }
+    } else if (path == "/schedule/v2") {
+      { status = 200; headers = {}; body = runRound(#v2) }
+    } else if (path == "/schedule/v3") {
+      { status = 200; headers = {}; body = runRound(#v3) }
+    } else if (path == "/schedule/v4") {
+      { status = 200; headers = {}; body = runRound(#v4) }
+    } else if (path == "/private/v1") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v1) }
+    } else if (path == "/private/v2") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v2) }
+    } else if (path == "/private/v3") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v3) }
+    } else if (path == "/private/v4") {
+      { status = 200; headers = {}; body = runRoundPrivate(#v4) }
+    } else if (path == "/schedule") {
+      {
+        status = 200;
+        headers = {};
+        body = {
+          v1 = runRound(#v1);
+          v2 = runRound(#v2);
+          v3 = runRound(#v3);
+          v4 = runRound(#v4);
+        };
+      }
+    } else {
+      {
+        status = 404;
+        headers = {};
+        body = "not found";
+      }
+    }
+  };
+}
